@@ -1,0 +1,286 @@
+
+
+import os
+import pandas as pd
+import sqlite3
+
+# --------------------------------------------------
+# 1. PATHS AND SETTINGS
+# --------------------------------------------------
+
+taxonomy_folder = (
+    r"C:\Users\isaia\Downloads\Authoritative Data\eBird Taxonomy"
+)
+
+target_table = (
+    r"C:\Users\isaia\Downloads\Inuit Bird Ranges\Match\DKKBreedingMigrantsUnmatched.csv"
+)
+
+botw_path = (
+    r"C:\Users\isaia\Downloads\Range Maps\species birdlife\BOTW_2025.gpkg"
+)
+
+output_csv = (
+   r"C:\Users\isaia\Downloads\Inuit Bird Ranges\Match\target_table_taxonomy_crosswalk.csv"
+)
+
+ambiguity_csv = (
+    r"C:\Users\isaia\Downloads\Inuit Bird Ranges\Match\taxonomy_ambiguities.csv"
+)
+
+botw_layer = "all_species"
+
+# Years available (2020 is missing)
+years = [y for y in range(2015, 2027) if y != 2020]
+
+
+# --------------------------------------------------
+# 2. HELPER FUNCTION
+# --------------------------------------------------
+
+def clean_name(series):
+    """Standardize names for matching."""
+    return (
+        series.fillna("")
+        .astype(str)
+        .str.strip()
+        .str.replace(r"\s+", " ", regex=True)
+        .str.casefold()
+    )
+
+def read_taxonomy(path):
+
+    try:
+        return pd.read_csv(
+            path,
+            dtype=str,
+            usecols=["PRIMARY_COM_NAME", "SCI_NAME", "CATEGORY"],
+            encoding="utf-8-sig"
+        )
+
+    except UnicodeDecodeError:
+        print(f"Using Windows encoding for: {os.path.basename(path)}")
+
+        return pd.read_csv(
+            path,
+            dtype=str,
+            usecols=["PRIMARY_COM_NAME", "SCI_NAME", "CATEGORY"],
+            encoding="cp1252"
+        )
+
+# --------------------------------------------------
+# 3. READ TARGET TABLE
+# --------------------------------------------------
+
+target = pd.read_csv(target_table, dtype=str)
+
+if "PRIMARY_COM_NAME" not in target.columns:
+    raise ValueError("Target table is missing PRIMARY_COM_NAME.")
+
+if os.path.abspath(target_table) == os.path.abspath(output_csv):
+    raise ValueError("Output cannot overwrite the input table.")
+
+target["_common_name_key"] = clean_name(
+    target["PRIMARY_COM_NAME"]
+)
+
+print(f"Target records: {len(target)}")
+
+
+# --------------------------------------------------
+# 4. JOIN EACH EBIRD TAXONOMY YEAR
+# --------------------------------------------------
+
+ambiguity_records = []
+
+for year in years:
+
+    taxonomy_path = os.path.join(
+        taxonomy_folder,
+        f"eBird_Taxonomy_v{year}.csv"
+    )
+
+    if not os.path.exists(taxonomy_path):
+        raise FileNotFoundError(taxonomy_path)
+
+    taxonomy = read_taxonomy(taxonomy_path)
+
+    # Keep species only
+    taxonomy = taxonomy[
+        taxonomy["CATEGORY"].str.strip().str.casefold() == "species"
+    ].copy()
+
+    # Remove records without usable names
+    taxonomy["SCI_NAME"] = taxonomy["SCI_NAME"].str.strip()
+
+    taxonomy = taxonomy[
+        taxonomy["SCI_NAME"].notna()
+        & (taxonomy["SCI_NAME"] != "")
+    ].copy()
+
+    taxonomy["_common_name_key"] = clean_name(
+        taxonomy["PRIMARY_COM_NAME"]
+    )
+
+    taxonomy = taxonomy[
+        taxonomy["_common_name_key"] != ""
+    ].copy()
+
+    # Identify common names associated with multiple
+    # distinct scientific names
+    duplicates = (
+        taxonomy.groupby("_common_name_key")["SCI_NAME"]
+        .nunique()
+    )
+
+    ambiguous_keys = duplicates[duplicates > 1].index
+
+    # Record ambiguous names for later review
+    if len(ambiguous_keys):
+
+        ambiguous = taxonomy[
+            taxonomy["_common_name_key"].isin(ambiguous_keys)
+        ].copy()
+
+        ambiguous["YEAR"] = year
+
+        ambiguity_records.append(
+            ambiguous[["YEAR", "PRIMARY_COM_NAME", "SCI_NAME"]]
+        )
+
+        print(
+            f"WARNING {year}: {len(ambiguous_keys)} "
+            "ambiguous common names excluded."
+        )
+
+    # Exclude ambiguous common names
+    taxonomy = taxonomy[
+        ~taxonomy["_common_name_key"].isin(ambiguous_keys)
+    ].copy()
+
+    # Remove redundant duplicate records
+    taxonomy = taxonomy.drop_duplicates(
+        subset="_common_name_key",
+        keep="first"
+    )
+
+    # Create lookup dictionary
+    lookup = taxonomy.set_index(
+        "_common_name_key"
+    )["SCI_NAME"]
+
+    # Add annual scientific name column
+    target[f"SCI_{year}"] = (
+        target["_common_name_key"]
+        .map(lookup)
+        .replace("", pd.NA)
+    )
+
+    matches = target[f"SCI_{year}"].notna().sum()
+
+    print(
+        f"{year}: {matches}/{len(target)} "
+        "records matched"
+    )
+
+
+# --------------------------------------------------
+# 5. READ BOTW 2025 ALL_SPECIES LAYER
+# --------------------------------------------------
+
+with sqlite3.connect(botw_path) as conn:
+
+    botw = pd.read_sql_query(
+        'SELECT sci_name FROM "all_species"',
+        conn
+    )
+
+botw_names = set(clean_name(botw["sci_name"]))
+botw_names.discard("")
+
+print(f"Unique BOTW scientific names: {len(botw_names)}")
+
+# --------------------------------------------------
+# 6. FIND FIRST ANNUAL SCIENTIFIC NAME MATCH
+# --------------------------------------------------
+
+sci_columns = [f"SCI_{year}" for year in years]
+
+# Initialize output columns
+target["BOTW_MATCH"] = pd.NA
+target["MATCH_YEAR"] = pd.NA
+
+# Check years chronologically
+for year, column in zip(years, sci_columns):
+
+    # Normalize annual scientific names
+    normalized = clean_name(target[column])
+
+    # Identify matches not already matched in an earlier year
+    matched = (
+        target["BOTW_MATCH"].isna()
+        & normalized.isin(botw_names)
+    )
+
+    # Record the first matching scientific name and year
+    target.loc[matched, "BOTW_MATCH"] = target.loc[
+        matched, column
+    ]
+
+    target.loc[matched, "MATCH_YEAR"] = year
+
+    print(
+        f"BOTW matches first identified in {year}: "
+        f"{matched.sum()}"
+    )
+
+
+# --------------------------------------------------
+# 7. CLEAN UP AND EXPORT
+# --------------------------------------------------
+
+target.drop(
+    columns=["_common_name_key"],
+    inplace=True
+)
+
+target.to_csv(
+    output_csv,
+    index=False,
+    encoding="utf-8-sig"
+)
+
+# Export ambiguous taxonomy names for review
+if ambiguity_records:
+
+    ambiguity_df = pd.concat(
+        ambiguity_records,
+        ignore_index=True
+    )
+
+    ambiguity_df.to_csv(
+        ambiguity_csv,
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+    print(f"Ambiguity report: {ambiguity_csv}")
+
+
+# --------------------------------------------------
+# 8. FINAL SUMMARY
+# --------------------------------------------------
+
+matched = target["BOTW_MATCH"].notna().sum()
+
+any_ebird_match = target[sci_columns].notna().any(axis=1).sum()
+
+print("\n------------------------------")
+print("CROSSWALK COMPLETE")
+print("------------------------------")
+print(f"Total records: {len(target)}")
+print(f"Matched to eBird: {any_ebird_match}")
+print(f"Matched to BOTW: {matched}")
+print(f"No BOTW match: {len(target) - matched}")
+print(f"Output: {output_csv}")
+
