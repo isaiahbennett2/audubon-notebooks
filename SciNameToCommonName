@@ -1,0 +1,209 @@
+
+import os
+import pandas as pd
+
+
+# --------------------------------------------------
+# PATHS AND SETTINGS
+# --------------------------------------------------
+
+# Input CSV containing scientific names
+input_csv = r"C:\Users\isaia\Downloads\Inuit Bird Ranges\Arctic Outputs\BreedingRangesArcticEcozonesClip.csv"
+
+# eBird taxonomy CSV folder
+taxonomy_folder = r"C:\Users\isaia\Downloads\Authoritative Data\eBird Taxonomy"
+
+# Output CSV
+output_csv = r"C:\Users\isaia\Downloads\Inuit Bird Ranges\Arctic Outputs\CommonNames_output.csv"
+
+# Ambiguity report
+ambiguity_csv = r"C:\Users\isaia\Downloads\Inuit Bird Ranges\Arctic Outputs\taxonomy_ambiguities.csv"
+
+# Scientific name field in input CSV
+sci_field = "sci_name"
+
+years = [y for y in range(2015, 2027) if y != 2020]
+
+
+# --------------------------------------------------
+# HELPER FUNCTIONS
+# --------------------------------------------------
+
+def clean_name(series):
+    return (
+        series.fillna("")
+        .astype(str)
+        .str.strip()
+        .str.replace(r"\s+", " ", regex=True)
+        .str.casefold()
+    )
+
+
+def read_taxonomy(path):
+    try:
+        return pd.read_csv(
+            path,
+            dtype=str,
+            usecols=["PRIMARY_COM_NAME", "SCI_NAME", "CATEGORY"],
+            encoding="utf-8-sig"
+        )
+    except UnicodeDecodeError:
+        print(f"Using Windows encoding for: {os.path.basename(path)}")
+        return pd.read_csv(
+            path,
+            dtype=str,
+            usecols=["PRIMARY_COM_NAME", "SCI_NAME", "CATEGORY"],
+            encoding="cp1252"
+        )
+
+
+# --------------------------------------------------
+# READ INPUT CSV
+# --------------------------------------------------
+
+target = pd.read_csv(input_csv, dtype=str, encoding="utf-8-sig")
+
+if sci_field not in target.columns:
+    raise ValueError(f"Input CSV does not contain a '{sci_field}' field.")
+
+target["_sci_key"] = clean_name(target[sci_field])
+
+target["EBIRD_COMMON_NAME"] = pd.NA
+target["MATCH_YEAR"] = pd.NA
+
+total_species = target.loc[
+    target["_sci_key"] != "", "_sci_key"
+].nunique()
+
+print(f"Input contains {total_species} unique scientific names.")
+
+
+# --------------------------------------------------
+# MATCH AGAINST ANNUAL EBIRD TAXONOMIES
+# --------------------------------------------------
+
+ambiguity_records = []
+
+for year in years:
+
+    unmatched_keys = set(
+        target.loc[
+            (target["EBIRD_COMMON_NAME"].isna()) &
+            (target["_sci_key"] != ""),
+            "_sci_key"
+        ]
+    )
+
+    if not unmatched_keys:
+        print("All scientific names matched.")
+        break
+
+    taxonomy_path = os.path.join(
+        taxonomy_folder,
+        f"eBird_Taxonomy_v{year}.csv"
+    )
+
+    if not os.path.exists(taxonomy_path):
+        print(f"Missing taxonomy file for {year}. Skipping.")
+        continue
+
+    taxonomy = read_taxonomy(taxonomy_path)
+
+    taxonomy = taxonomy[
+        taxonomy["CATEGORY"].str.strip().str.casefold() == "species"
+    ].copy()
+
+    taxonomy["_sci_key"] = clean_name(taxonomy["SCI_NAME"])
+    taxonomy["_common_key"] = clean_name(taxonomy["PRIMARY_COM_NAME"])
+
+    taxonomy = taxonomy[
+        (taxonomy["_sci_key"] != "") &
+        (taxonomy["_common_key"] != "") &
+        (taxonomy["_sci_key"].isin(unmatched_keys))
+    ].copy()
+
+    # Identify scientific names with multiple common names
+    common_name_counts = taxonomy.groupby("_sci_key")["_common_key"].nunique()
+
+    ambiguous_keys = set(
+        common_name_counts[common_name_counts > 1].index
+    )
+
+    if ambiguous_keys:
+        ambiguous_rows = taxonomy[
+            taxonomy["_sci_key"].isin(ambiguous_keys)
+        ]
+
+        for _, row in ambiguous_rows.iterrows():
+            ambiguity_records.append({
+                "YEAR": year,
+                "SCI_NAME": row["SCI_NAME"],
+                "PRIMARY_COM_NAME": row["PRIMARY_COM_NAME"]
+            })
+
+    # Exclude ambiguous names for this year
+    taxonomy = taxonomy[
+        ~taxonomy["_sci_key"].isin(ambiguous_keys)
+    ]
+
+    # Build scientific name -> common name lookup
+    lookup = (
+        taxonomy.drop_duplicates("_sci_key")
+        .set_index("_sci_key")["PRIMARY_COM_NAME"]
+        .to_dict()
+    )
+
+    # Fill only records that haven't matched yet
+    mapped_names = target["_sci_key"].map(lookup)
+
+    fill_mask = (
+        target["EBIRD_COMMON_NAME"].isna() &
+        mapped_names.notna()
+    )
+
+    target.loc[fill_mask, "EBIRD_COMMON_NAME"] = mapped_names[fill_mask]
+    target.loc[fill_mask, "MATCH_YEAR"] = year
+
+    newly_matched = target.loc[fill_mask, "_sci_key"].nunique()
+
+    matched_total = target.loc[
+        target["EBIRD_COMMON_NAME"].notna(), "_sci_key"
+    ].nunique()
+
+    print(
+        f"{year}: {newly_matched} new matches | "
+        f"{matched_total}/{total_species} total matched"
+    )
+
+
+# --------------------------------------------------
+# EXPORT RESULTS
+# --------------------------------------------------
+
+target.drop(columns=["_sci_key"], inplace=True)
+
+target.to_csv(
+    output_csv,
+    index=False,
+    encoding="utf-8-sig"
+)
+
+if ambiguity_records:
+    pd.DataFrame(ambiguity_records).to_csv(
+        ambiguity_csv,
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+matched_count = target["EBIRD_COMMON_NAME"].notna().sum()
+unmatched = target[target["EBIRD_COMMON_NAME"].isna()]
+
+print("\nFinished!")
+print(f"Output: {output_csv}")
+print(f"Matched records: {matched_count}")
+print(f"Unmatched records: {len(unmatched)}")
+print(f"Ambiguous taxonomy records: {len(ambiguity_records)}")
+
+if len(unmatched) > 0:
+    print("\nScientific names without a match:")
+    print(unmatched[sci_field].drop_duplicates().to_list())
