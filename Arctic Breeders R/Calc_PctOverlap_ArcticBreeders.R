@@ -38,7 +38,7 @@ library(readr)
 
 # 2. User-defined paths ---------------------------------------
 
-shapefile_path <- "C:/Users/isaia/Downloads/Inuit Bird Ranges/Arctic Outputs/ArcticEcozonesSolid.shp"
+shapefile_path <- "C:/Users/isaia/Downloads/Inuit Bird Ranges/Arctic Outputs/ArcticEcozonesLand.shp"
 
 data_path <- "C:/Users/isaia/Downloads/Inuit Bird Ranges/Arctic Outputs/eBirdRasters/Clipped"
 
@@ -46,8 +46,10 @@ output_folder <- "C:/Users/isaia/Downloads/Inuit Bird Ranges/Arctic Outputs/eBir
 
 output_path <- file.path(
   output_folder,
-  "ebird_breeding_abundance_overlap.csv"
+  "ebird_breeding_abundance_overlap_fullrange.csv"
 )
+
+crosswalk_csv <- "C:/Users/isaia/Downloads/Inuit Bird Ranges/Arctic Outputs/eBirdRasters/Arctic_Bird_Species_Crosswalk.csv"
 
 
 # 3. Read and prepare the study-area polygon ------------------
@@ -57,6 +59,13 @@ study_area <- st_read(shapefile_path, quiet = TRUE) |>
   summarise(geometry = st_union(geometry))
 
 study_area <- st_zm(study_area, drop = TRUE, what = "ZM")
+
+# Read full range crosswalk table 
+crosswalk <- read.csv(
+  crosswalk_csv,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
 
 
 # 4. Find all breeding abundance rasters -----------------------
@@ -242,9 +251,25 @@ summarize_abundance_raster <- function(file, polygon) {
   )
 }
 
+# 7. Summarize one full range raster --------------------------
+summarize_full_range <- function(file) {
+  
+  r <- rast(file)
+  
+  # Count cells with positive abundance
+  positive_cell_equiv <- global(
+    r > 0,
+    "sum",
+    na.rm = TRUE
+  )[1, 1]
+  
+  tibble(
+    full_range_positive_cell_equiv = positive_cell_equiv,
+    raster_file = file
+  )
+}
 
-
-# 7. Process every raster -------------------------------------
+# 8. Process every raster -------------------------------------
 
 abundance_results <- map_dfr(
   raster_files,
@@ -258,8 +283,51 @@ abundance_results <- map_dfr(
   arrange(desc(percent_modeled_area_with_abundance))
 
 
+# Create join field in full range table 
+crosswalk <- crosswalk |>
+  mutate(CommonName_join = str_replace_all(CommonName, "'", " "))
 
-# 8. Export results --------------------------------------------
+names(crosswalk)
+# Join proper Common Name to get ride of spaces where apostrophes are 
+
+abundance_results <- abundance_results |>
+  left_join(
+    crosswalk |>
+      select(CommonName, CommonName_join),
+    by = c("species_name" = "CommonName_join")
+  ) |>
+  mutate(
+    species_name = coalesce(CommonName, species_name)
+  ) |>
+  select(-CommonName)
+
+
+# Process every full range raster 
+
+full_range_results <- map_dfr(
+  crosswalk$raster_file,
+  summarize_full_range
+) |>
+  left_join(
+    crosswalk |>
+      select(raster_file, CommonName),
+    by = "raster_file"
+  )
+
+# Join to Arctic abundance results
+abundance_results <- abundance_results |>
+  left_join(
+    full_range_results |>
+      select(CommonName, full_range_positive_cell_equiv),
+    by = c("species_name" = "CommonName")
+  )
+
+abundance_results <- abundance_results |>
+  mutate(
+    percent_breeding_range_in_arctic =
+      100 * positive_abundance_cell_equiv / full_range_positive_cell_equiv
+  )
+# 9. Export results --------------------------------------------
 
 write_csv(
   abundance_results,
@@ -271,33 +339,4 @@ message(
   output_path
 )
 
-# 9. Join proper name field -----------------------------------
 
-# Replace species names in overlap report with original CommonName values.
-
-raster_report <- read_csv(
-  "C:/Users/isaia/Downloads/Inuit Bird Ranges/Arctic Outputs/eBirdRasters/Clipped/Arctic_Breeding_Raster_Report.csv"
-) |>
-  mutate(
-    CommonName_join = str_replace_all(CommonName, "'", " ")
-  )
-
-overlap_report <- read_csv(
-  "C:/Users/isaia/Downloads/Inuit Bird Ranges/Arctic Outputs/eBirdRasters/OverlapOutput/ebird_breeding_abundance_overlap.csv"
-)
-
-overlap_report <- overlap_report |>
-  left_join(
-    raster_report |>
-      select(CommonName, CommonName_join),
-    by = c("species_name" = "CommonName_join")
-  ) |>
-  mutate(
-    species_name = coalesce(CommonName, species_name)
-  ) |>
-  select(-CommonName)
-
-write_csv(
-  overlap_report,
-  "C:/Users/isaia/Downloads/Inuit Bird Ranges/Arctic Outputs/eBirdRasters/OverlapOutput/ebird_breeding_abundance_overlap.csv"
-)

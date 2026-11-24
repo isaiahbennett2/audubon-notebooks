@@ -12,6 +12,7 @@
 library(sf)
 library(ebirdst)
 library(terra)
+library(dplyr)
 
 
 # ------------------------------------------------------------
@@ -88,6 +89,27 @@ if (!"BreedingStatus" %in% names(species_table)) {
 }
 
 cat("\nNumber of species in CSV:", length(spp_list), "\n")
+
+# ------------------------------------------------------------
+# 4a CREATE SPECIES CODE-COMMON NAME CROSSWALK
+# ------------------------------------------------------------
+species_crosswalk <- species_table |>
+  mutate(
+    name_key = tolower(trimws(CommonName))
+  ) |>
+  left_join(
+    ebirdst_runs |>
+      transmute(
+        name_key = tolower(trimws(common_name)),
+        species_code
+      ),
+    by = "name_key"
+  ) |>
+  select(CommonName, species_code, BreedingStatus)
+
+# Check for species without a matching eBird code
+species_crosswalk |>
+  filter(is.na(species_code))
 
 
 # ------------------------------------------------------------
@@ -283,6 +305,38 @@ write.csv(
   row.names = FALSE
 )
 
+# ------------------------------------------------------------
+# 8a JOIN FULL FILEPATH TO CROSSWALK
+# ------------------------------------------------------------
+
+full_range_path <- "C:/Users/isaia/Downloads/Inuit Bird Ranges/Arctic Outputs/eBirdRasters/2023"
+
+full_range_files <- list.files(
+  path = full_range_path,
+  pattern = "_abundance_seasonal_mean_3km_2023\\.tif$",
+  full.names = TRUE,
+  recursive = TRUE,
+  ignore.case = TRUE
+)
+
+full_range_table <- tibble(
+  raster_file = full_range_files,
+  species_code = sub(
+    "_abundance_seasonal_mean_3km_2023\\.tif$",
+    "",
+    basename(full_range_files)
+  )
+) |>
+  left_join(
+    species_crosswalk,
+    by = "species_code"
+  )
+
+# Save crosswalk
+write.csv(
+  full_range_table,
+  file.path(data_dir, "Arctic_Bird_Species_Crosswalk.csv")
+)
 
 # ------------------------------------------------------------
 # 9. SUMMARY
